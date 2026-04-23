@@ -35,21 +35,10 @@ jobs:
       - name: Install frontend dependencies
         run: cd frontend && npm install
 
-      - name: Install ESLint
-        run: cd frontend && npm install --save-dev eslint@8 @eslint/js
-
-      - name: Create ESLint config
-        run: |
-          cat > frontend/.eslintrc.json << 'ESLINT'
-          {
-            "env": { "node": true, "es2021": true },
-            "extends": "eslint:recommended",
-            "parserOptions": { "ecmaVersion": 2021 }
-          }
-          ESLINT
-
       - name: Lint JavaScript
-        run: cd frontend && npx eslint app.js
+        run: |
+          npm install -g eslint@8
+          eslint frontend/app.js --env node --env es2021 --parser-options ecmaVersion:2021
 
       - name: Install Hadolint
         run: |
@@ -85,8 +74,8 @@ jobs:
           cat > api/test_main.py << 'PYTEST'
           import pytest
           from fastapi.testclient import TestClient
-          from unittest.mock import patch, MagicMock
           import fakeredis
+          from unittest.mock import patch
 
           fake_redis = fakeredis.FakeRedis(decode_responses=True)
 
@@ -95,12 +84,14 @@ jobs:
 
           client = TestClient(app)
 
+
           def test_create_job_returns_job_id():
               response = client.post("/jobs")
               assert response.status_code == 200
               data = response.json()
               assert "job_id" in data
               assert len(data["job_id"]) == 36
+
 
           def test_get_job_status_queued():
               response = client.post("/jobs")
@@ -109,10 +100,12 @@ jobs:
               assert status_response.status_code == 200
               assert status_response.json()["status"] == "queued"
 
+
           def test_get_job_not_found():
               response = client.get("/jobs/nonexistent-id")
               assert response.status_code == 200
               assert "error" in response.json()
+
 
           def test_create_multiple_jobs():
               ids = set()
@@ -121,6 +114,7 @@ jobs:
                   assert r.status_code == 200
                   ids.add(r.json()["job_id"])
               assert len(ids) == 3
+
 
           def test_job_status_returns_job_id():
               response = client.post("/jobs")
@@ -189,48 +183,23 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Save image names
-        run: |
-          echo "localhost:5000/api:${{ github.sha }}" > image-tags.txt
-          echo "localhost:5000/worker:${{ github.sha }}" >> image-tags.txt
-          echo "localhost:5000/frontend:${{ github.sha }}" >> image-tags.txt
-
-      - name: Upload image tags
-        uses: actions/upload-artifact@v4
-        with:
-          name: image-tags
-          path: image-tags.txt
-
   security:
     name: Security Scan
     runs-on: ubuntu-latest
     needs: build
-    services:
-      registry:
-        image: registry:2
-        ports:
-          - 5000:5000
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: network=host
-
-      - name: Rebuild images for scanning
+      - name: Build images for scanning
         run: |
-          docker build -t localhost:5000/api:${{ github.sha }} ./api
-          docker build -t localhost:5000/worker:${{ github.sha }} ./worker
-          docker build -t localhost:5000/frontend:${{ github.sha }} ./frontend
+          docker build -t api:scan ./api
+          docker build -t worker:scan ./worker
+          docker build -t frontend:scan ./frontend
 
       - name: Install Trivy
         run: |
-          wget -qO- https://aquasecurity.github.io/trivy-repo/deb/public.key | \
-            sudo apt-key add -
-          echo "deb https://aquasecurity.github.io/trivy-repo/deb generic main" | \
-            sudo tee /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update && sudo apt-get install -y trivy
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | \
+            sudo sh -s -- -b /usr/local/bin
 
       - name: Scan API image
         run: |
@@ -239,7 +208,7 @@ jobs:
             --severity CRITICAL \
             --format sarif \
             --output trivy-api.sarif \
-            localhost:5000/api:${{ github.sha }}
+            api:scan
 
       - name: Scan Worker image
         run: |
@@ -248,7 +217,7 @@ jobs:
             --severity CRITICAL \
             --format sarif \
             --output trivy-worker.sarif \
-            localhost:5000/worker:${{ github.sha }}
+            worker:scan
 
       - name: Scan Frontend image
         run: |
@@ -257,7 +226,7 @@ jobs:
             --severity CRITICAL \
             --format sarif \
             --output trivy-frontend.sarif \
-            localhost:5000/frontend:${{ github.sha }}
+            frontend:scan
 
       - name: Upload Trivy results
         uses: actions/upload-artifact@v4
@@ -286,33 +255,28 @@ jobs:
 
       - name: Wait for all services healthy
         run: |
-          echo "Waiting for services..."
+          echo "Waiting for services to be healthy..."
           for i in $(seq 1 30); do
-            healthy=$(docker compose ps --format json | \
+            COUNT=$(docker compose ps --format json 2>/dev/null | \
               python3 -c "
           import sys, json
-          data = sys.stdin.read().strip().split('\n')
-          services = [json.loads(l) for l in data if l]
-          all_healthy = all(
-            s.get('Health','') in ['healthy',''] 
-            for s in services
-          )
-          print('yes' if all_healthy else 'no')
-          ")
-            if [ "$healthy" = "yes" ]; then
+          lines = [l for l in sys.stdin.read().strip().split('\n') if l]
+          services = [json.loads(l) for l in lines]
+          healthy = sum(1 for s in services if s.get('Health','') == 'healthy')
+          print(healthy)
+          " 2>/dev/null || echo "0")
+            echo "Healthy services: $COUNT/4"
+            if [ "$COUNT" = "4" ]; then
               echo "All services healthy"
               break
             fi
-            echo "Attempt $i/30 - waiting..."
             sleep 5
           done
 
       - name: Run integration test
         run: |
-          # Submit a job through the frontend
-          JOB_RESPONSE=$(docker exec \
-            $(docker compose ps -q frontend) \
-            node -e "
+          FRONTEND=$(docker compose ps -q frontend)
+          JOB_RESPONSE=$(docker exec $FRONTEND node -e "
           const axios = require('axios');
           axios.post('http://api:8000/jobs')
             .then(r => { console.log(JSON.stringify(r.data)); process.exit(0); })
@@ -321,12 +285,8 @@ jobs:
           echo "Job response: $JOB_RESPONSE"
           JOB_ID=$(echo $JOB_RESPONSE | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['job_id'])")
           echo "Job ID: $JOB_ID"
-
-          # Poll until completed or timeout
           for i in $(seq 1 15); do
-            STATUS=$(docker exec \
-              $(docker compose ps -q frontend) \
-              node -e "
+            STATUS=$(docker exec $FRONTEND node -e "
           const axios = require('axios');
           axios.get('http://api:8000/jobs/$JOB_ID')
             .then(r => { console.log(r.data.status); process.exit(0); })
@@ -334,12 +294,12 @@ jobs:
             ")
             echo "Poll $i: status=$STATUS"
             if [ "$STATUS" = "completed" ]; then
-              echo "Job completed successfully"
+              echo "Integration test passed"
               exit 0
             fi
             sleep 2
           done
-          echo "Job did not complete in time"
+          echo "FAILED: job did not complete"
           exit 1
 
       - name: Tear down stack
@@ -362,21 +322,13 @@ jobs:
           key: ${{ secrets.SERVER_SSH_KEY }}
           script: |
             cd /home/hngdevops/app
-
-            # Pull latest code
             git pull origin main
-
-            # Build new images
             docker compose build
-
-            # Rolling update - start new, verify health, stop old
             docker compose up -d --no-deps --build api
             timeout 60 bash -c 'until docker inspect --format="{{.State.Health.Status}}" $(docker compose ps -q api) | grep -q healthy; do sleep 2; done' || \
-              { echo "API health check failed - aborting deploy"; exit 1; }
-
+              { echo "API health check failed"; exit 1; }
             docker compose up -d --no-deps --build worker
             docker compose up -d --no-deps --build frontend
             timeout 60 bash -c 'until docker inspect --format="{{.State.Health.Status}}" $(docker compose ps -q frontend) | grep -q healthy; do sleep 2; done' || \
-              { echo "Frontend health check failed - aborting deploy"; exit 1; }
-
+              { echo "Frontend health check failed"; exit 1; }
             echo "Deploy successful"
