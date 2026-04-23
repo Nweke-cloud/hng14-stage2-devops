@@ -314,21 +314,59 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Deploy to server
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          script: |
-            cd /home/hngdevops/app
-            git pull origin main
-            docker compose build
-            docker compose up -d --no-deps --build api
-            timeout 60 bash -c 'until docker inspect --format="{{.State.Health.Status}}" $(docker compose ps -q api) | grep -q healthy; do sleep 2; done' || \
-              { echo "API health check failed"; exit 1; }
-            docker compose up -d --no-deps --build worker
-            docker compose up -d --no-deps --build frontend
-            timeout 60 bash -c 'until docker inspect --format="{{.State.Health.Status}}" $(docker compose ps -q frontend) | grep -q healthy; do sleep 2; done' || \
-              { echo "Frontend health check failed"; exit 1; }
-            echo "Deploy successful"
+      - name: Create .env
+        run: |
+          echo "REDIS_PASSWORD=testpassword123" > .env
+          echo "APP_ENV=production" >> .env
+
+      - name: Start initial stack
+        run: |
+          docker compose up -d
+          echo "Waiting for initial stack to be healthy..."
+          sleep 30
+
+      - name: Rolling update API
+        run: |
+          docker compose up -d --no-deps --build api
+          echo "Waiting for API health check..."
+          SECONDS=0
+          until docker inspect --format="{{.State.Health.Status}}" \
+            $(docker compose ps -q api) 2>/dev/null | grep -q "healthy"; do
+            if [ $SECONDS -ge 60 ]; then
+              echo "API health check failed after 60s - aborting"
+              exit 1
+            fi
+            echo "Waiting... ${SECONDS}s"
+            sleep 2
+          done
+          echo "API is healthy"
+
+      - name: Rolling update Worker
+        run: |
+          docker compose up -d --no-deps --build worker
+          echo "Worker updated"
+
+      - name: Rolling update Frontend
+        run: |
+          docker compose up -d --no-deps --build frontend
+          echo "Waiting for Frontend health check..."
+          SECONDS=0
+          until docker inspect --format="{{.State.Health.Status}}" \
+            $(docker compose ps -q frontend) 2>/dev/null | grep -q "healthy"; do
+            if [ $SECONDS -ge 60 ]; then
+              echo "Frontend health check failed after 60s - aborting"
+              exit 1
+            fi
+            echo "Waiting... ${SECONDS}s"
+            sleep 2
+          done
+          echo "Frontend is healthy"
+
+      - name: Verify final stack
+        run: |
+          docker compose ps
+          echo "Deploy completed successfully"
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
