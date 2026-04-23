@@ -58,3 +58,21 @@
 **File:** `api/` (missing), `worker/` (missing), `frontend/` (missing)
 **Problem:** No `.dockerignore` files. Without them, `.env` files, `__pycache__`, and `node_modules` get copied into Docker images, leaking secrets and bloating image size.
 **Fix:** Created `.dockerignore` for each service excluding `.env`, `__pycache__`, `*.pyc`, and `node_modules`.
+
+## Fix 11
+**File:** `api/main.py`
+**Line:** 17, 24
+**Problem:** Missing two blank lines before function definitions. flake8 E302 requires two blank lines between top-level functions in Python.
+**Fix:** Added two blank lines before each `@app.post` and `@app.get` decorator.
+
+## Fix 12
+**File:** `worker/worker.py`
+**Line:** multiple
+**Problem:** Same flake8 E302 issue — missing two blank lines between top-level function definitions.
+**Fix:** Added two blank lines between all top-level functions.
+
+## Fix 13
+**File:** `api/Dockerfile`, `worker/Dockerfile`
+**Line:** 5
+**Problem:** hadolint DL3042 — pip install without `--no-cache-dir` on the upgrade line causes unnecessary cache to be stored in the image, increasing image size.
+**Fix:** Added `--no-cache-dir` to the `pip install --upgrade pip` command.
